@@ -1,16 +1,17 @@
-import rclpy
-from rclpy.node import Node
-from std_msgs.msg import UInt8, UInt32, Image
-from sensor_msgs.msg import Image as ROSImage
-from cv_bridge import CvBridge
 from ultralytics import YOLO
 import numpy as np
 import torch
 import gc
 import cv2
-import os
-from ament_index_python.packages import get_package_share_directory
-from route_yolo_ros2.srv import DetectObject  
+import easyocr 
+
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import UInt8, UInt32
+from sensor_msgs.msg import Image as ROSImage
+from cv_bridge import CvBridge
+from route_yolo_service.srv import DetectObject
+
 
 
 class YoloDetector(Node):
@@ -18,22 +19,21 @@ class YoloDetector(Node):
         super().__init__('YoloDetector')
         self.bridge = CvBridge()
         self.cam_image = None
-        self.last_count = 0
-        self.last_size = 0
+        self.reader = easyocr.Reader(["en"], gpu=True, verbose=False)
 
         # Declare parameters
-        self.declare_parameter('enable', True)
+        self.declare_parameter("image_topic", "/routecam")
+        self.declare_parameter("coco_model_path", "")
+        self.declare_parameter("tire_model_path", "")
         self.declare_parameter('flip_image', False)
         self.declare_parameter('image_resize', 640)
 
-        # Load YOLO model paths from package share
-        pkg_share = get_package_share_directory('route_yolo_ros2')
-        self.model_coco_path = os.path.join(pkg_share, 'models', 'coco.pt')
-        self.model_stop_path = os.path.join(pkg_share, 'models', 'stop.pt')
-        self.model_tire_path = os.path.join(pkg_share, 'models', 'tire.pt')
+        # Load YOLO model paths
+        self.model_coco_path = self.get_parameter("coco_model_path").value
+        self.model_tire_path = self.get_parameter("tire_model_path").value
 
         # Subscribers
-        self.create_subscription(ROSImage, '/camera/image_raw', self.image_callback, 10)
+        self.create_subscription(ROSImage, self.get_parameter("image_topic").value, self.image_callback, 10)
 
         # Service
         self.create_service(DetectObject, 'detect_object', self.handle_detection_request)
@@ -41,8 +41,6 @@ class YoloDetector(Node):
         self.get_logger().info("YOLO Service-Based Detector Initialized")
 
     def image_callback(self, msg):
-        if not self.get_parameter('enable').get_parameter_value().bool_value:
-            return
         try:
             img = self.bridge.imgmsg_to_cv2(msg, "bgr8")
         except Exception as e:
@@ -71,52 +69,69 @@ class YoloDetector(Node):
             response.size = 0
             return response
 
-        self.detect(request.target)
-        response.count = self.last_count
-        response.size = self.last_size
+        count, size = self.detect(request.target)
+        response.count = count
+        response.size = size
         return response
 
     def detect(self, mode):
         model_path = {
-            'stop': self.model_stop_path,
+            'stop': self.model_coco_path,
             'tire': self.model_tire_path,
             'person': self.model_coco_path
         }[mode]
 
+        im = self.cam_image.copy()
         yolo = YOLO(model_path)
-        results = yolo(source=self.cam_image, device="0", stream=False, verbose=False, conf=0.5)
+        
+        target_ids = {
+            'person': 0,
+            'stop': 11,
+            'tire': 0,
+        }
 
-        label_set = {
-            'stop': {'stop sign'},
-            'tire': {'tire'},
-            'person': {'person'}
-        }[mode]
+        results = yolo.predict(source=im, device="0", stream=False, verbose=False, conf=0.5, classes=[target_ids[mode]], show=True)
+        # results = yolo.predict(source=im, device="0", stream=False, conf=0.5, verbose=False, show=True)
 
-        count, biggest, _ = self.analyze_results(results, label_set)
-
-        self.last_count = count
-        self.last_size = biggest
+        count, biggest, _ = self.analyze_results(results, im, mode)
 
         torch.cuda.empty_cache()
         gc.collect()
+        
+        return count, biggest
 
-    def analyze_results(self, results, label_set):
+    def analyze_results(self, results, image, mode):
         detected = 0
         biggest_bbox = 0
-        image_size = self.cam_image.shape[0] * self.cam_image.shape[1]
+        image_size = image.shape[0] * image.shape[1]
 
         for result in results:
             boxes = result.boxes.cpu().numpy()
-            labels = result.names
             for box in boxes:
-                label = labels[int(box.cls)]
-                if label in label_set:
-                    detected += 1
-                    area = 100 * ((box.xywh[0][2] * box.xywh[0][3]) / image_size)
-                    if area > biggest_bbox:
-                        biggest_bbox = area
+                if mode == 'stop':
+                    xyxy = box.xyxy
+                    self.get_logger().info(f"{xyxy}")
+                    sign_image = image[int(xyxy[0][1]):int(xyxy[0][3]), int(xyxy[0][0]):int(xyxy[0][2])]
+                    if not self.stopsign_ocr_check(sign_image):
+                        continue # skip the detection
+                detected += 1
+                area = 100 * ((box.xywh[0][2] * box.xywh[0][3]) / image_size)
+                if area > biggest_bbox:
+                    biggest_bbox = area
 
         return detected, int(biggest_bbox * 100), results[0].plot()
+    
+    def stopsign_ocr_check(self, sign_image):
+        stop_found = False
+        readings = self.reader.readtext(cv2.cvtColor(sign_image, cv2.COLOR_BGR2RGB))
+        for _, text, _ in readings:
+            text.replace("0", "O")
+            self.get_logger().info(f"Sign reads: {text}")
+            if text.upper() == "STOP":
+                stop_found = True
+                break
+        return stop_found
+    
 
     def letterbox_resize(self, img, size=(640, 640)):
         h, w = img.shape[:2]
